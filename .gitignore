@@ -1,10 +1,15 @@
 # Binaries
 dbdiff
+dbdiff-*
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
+
+# Build directory
+build/
+dist/
 
 # Test binary
 *.test

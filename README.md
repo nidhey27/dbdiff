@@ -21,18 +21,68 @@ Compares the following schema elements:
 
 ## Installation
 
+### Option 1: Download Pre-built Binaries (Recommended)
+
+Download the latest release for your platform from the [Releases page](https://github.com/YOUR_USERNAME/dbdiff/releases).
+
+**Linux (AMD64)**
 ```bash
-# Clone or download the repository
+wget https://github.com/YOUR_USERNAME/dbdiff/releases/latest/download/dbdiff-linux-amd64
+chmod +x dbdiff-linux-amd64
+sudo mv dbdiff-linux-amd64 /usr/local/bin/dbdiff
+```
+
+**Linux (ARM64)**
+```bash
+wget https://github.com/YOUR_USERNAME/dbdiff/releases/latest/download/dbdiff-linux-arm64
+chmod +x dbdiff-linux-arm64
+sudo mv dbdiff-linux-arm64 /usr/local/bin/dbdiff
+```
+
+**macOS (Intel)**
+```bash
+wget https://github.com/YOUR_USERNAME/dbdiff/releases/latest/download/dbdiff-darwin-amd64
+chmod +x dbdiff-darwin-amd64
+sudo mv dbdiff-darwin-amd64 /usr/local/bin/dbdiff
+```
+
+**macOS (Apple Silicon)**
+```bash
+wget https://github.com/YOUR_USERNAME/dbdiff/releases/latest/download/dbdiff-darwin-arm64
+chmod +x dbdiff-darwin-arm64
+sudo mv dbdiff-darwin-arm64 /usr/local/bin/dbdiff
+```
+
+**Windows (AMD64)**
+```powershell
+# Download dbdiff-windows-amd64.exe from releases
+# Add to your PATH or run directly
+```
+
+**Windows (ARM64)**
+```powershell
+# Download dbdiff-windows-arm64.exe from releases
+# Add to your PATH or run directly
+```
+
+### Option 2: Build from Source
+
+```bash
+# Clone the repository
+git clone https://github.com/YOUR_USERNAME/dbdiff.git
 cd dbdiff
 
 # Install dependencies
 go mod download
 
-# Build the binary
-go build -o dbdiff main.go
+# Build for current platform
+make build
+
+# Or build for all platforms
+make build-all
 
 # Optional: Install globally
-go install
+make install
 ```
 
 ## Usage
@@ -230,6 +280,66 @@ mysql -h 127.0.0.1 -P 3307 -u root -ppass -e "CREATE DATABASE testdb; USE testdb
   --target-driver mysql
 ```
 
+## Creating a Release
+
+### For Maintainers
+
+To create a new release with pre-built binaries:
+
+1. **Tag the release:**
+   ```bash
+   git tag -a v1.0.0 -m "Release version 1.0.0"
+   git push origin v1.0.0
+   ```
+
+2. **GitHub Actions will automatically:**
+   - Build binaries for all platforms (Linux, macOS, Windows - AMD64 & ARM64)
+   - Generate SHA256 checksums
+   - Create a GitHub release with all binaries attached
+   - Add installation instructions to the release notes
+
+3. **Manual local build (optional):**
+   ```bash
+   # Build all platform binaries locally
+   make release VERSION=1.0.0
+
+   # Binaries will be in build/ directory
+   ls -lh build/
+   ```
+
+### Available Platforms
+
+- **Linux**: AMD64, ARM64
+- **macOS**: AMD64 (Intel), ARM64 (Apple Silicon)
+- **Windows**: AMD64, ARM64
+
+## Development
+
+### Makefile Commands
+
+```bash
+make help          # Show all available commands
+make build         # Build for current platform
+make build-all     # Build for all platforms
+make checksums     # Generate SHA256 checksums
+make install       # Install to /usr/local/bin
+make clean         # Remove build artifacts
+make test          # Run tests
+make deps          # Download dependencies
+make release       # Create release build (requires VERSION)
+```
+
+### Project Structure
+
+```
+dbdiff/
+├── main.go                      # Complete implementation (~1,300 lines)
+├── go.mod                       # Go module definition
+├── Makefile                     # Build automation
+├── .github/workflows/release.yml # Automated release workflow
+└── README.md                    # Documentation
+```
+
 ## License
 
 MIT
@@ -244,4 +354,6 @@ Contributions welcome! This is a production-ready MVP that can be extended with:
 - Configuration file support
 - Parallel schema extraction for large databases
 - Data comparison (not just schema)
+- Homebrew formula for easier macOS installation
+- Chocolatey package for easier Windows installation
 
