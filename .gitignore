@@ -31,3 +31,6 @@ go.work
 .DS_Store
 Thumbs.db
 
+# Test files
+*TEST_RESULTS.md
+test_*.sql

@@ -6,8 +6,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
+	"sync"
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
@@ -66,6 +68,51 @@ type Index struct {
 type CheckConstr struct {
 	Name       string `json:"name"`
 	Expression string `json:"expression"`
+}
+
+// ============================================================================
+// FILTER CONFIG - Filtering options
+// ============================================================================
+
+type FilterConfig struct {
+	IgnoreTables       []string // Exact table names to ignore
+	IgnoreTablePattern *regexp.Regexp // Regex pattern for table names to ignore
+	IgnoreColumns      map[string][]string // Map of table -> columns to ignore
+	IgnoreIndexes      bool // Ignore all index differences
+	IgnoreForeignKeys  bool // Ignore all foreign key differences
+	IgnoreChecks       bool // Ignore all check constraint differences
+}
+
+func NewFilterConfig() *FilterConfig {
+	return &FilterConfig{
+		IgnoreTables:  []string{},
+		IgnoreColumns: make(map[string][]string),
+	}
+}
+
+func (fc *FilterConfig) ShouldIgnoreTable(tableName string) bool {
+	// Check exact matches
+	for _, t := range fc.IgnoreTables {
+		if t == tableName {
+			return true
+		}
+	}
+	// Check pattern
+	if fc.IgnoreTablePattern != nil && fc.IgnoreTablePattern.MatchString(tableName) {
+		return true
+	}
+	return false
+}
+
+func (fc *FilterConfig) ShouldIgnoreColumn(tableName, columnName string) bool {
+	if cols, ok := fc.IgnoreColumns[tableName]; ok {
+		for _, c := range cols {
+			if c == columnName {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ============================================================================
@@ -129,6 +176,7 @@ type CheckDiff struct {
 
 type Dialect interface {
 	ExtractSchema(db *sql.DB) (*Schema, error)
+	ExtractSchemaParallel(db *sql.DB) (*Schema, error)
 }
 
 // ============================================================================
@@ -187,6 +235,84 @@ func (p *PostgresDialect) ExtractSchema(db *sql.DB) (*Schema, error) {
 		}
 
 		schema.Tables[tableName] = table
+	}
+
+	return schema, nil
+}
+
+func (p *PostgresDialect) ExtractSchemaParallel(db *sql.DB) (*Schema, error) {
+	schema := &Schema{Tables: make(map[string]*Table)}
+
+	// Get all tables
+	tables, err := p.getTables(db)
+	if err != nil {
+		return nil, err
+	}
+
+	// Use a wait group and mutex for parallel extraction
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	errChan := make(chan error, len(tables))
+
+	for _, tableName := range tables {
+		wg.Add(1)
+		go func(tName string) {
+			defer wg.Done()
+
+			table := &Table{
+				Name:              tName,
+				Columns:           make(map[string]*Column),
+				ForeignKeys:       make(map[string]*ForeignKey),
+				UniqueConstraints: make(map[string]*Unique),
+				Indexes:           make(map[string]*Index),
+				CheckConstraints:  make(map[string]*CheckConstr),
+			}
+
+			// Extract all metadata for this table
+			if err := p.extractColumns(db, tName, table); err != nil {
+				errChan <- fmt.Errorf("error extracting columns for %s: %w", tName, err)
+				return
+			}
+
+			if err := p.extractPrimaryKey(db, tName, table); err != nil {
+				errChan <- fmt.Errorf("error extracting primary key for %s: %w", tName, err)
+				return
+			}
+
+			if err := p.extractForeignKeys(db, tName, table); err != nil {
+				errChan <- fmt.Errorf("error extracting foreign keys for %s: %w", tName, err)
+				return
+			}
+
+			if err := p.extractUniqueConstraints(db, tName, table); err != nil {
+				errChan <- fmt.Errorf("error extracting unique constraints for %s: %w", tName, err)
+				return
+			}
+
+			if err := p.extractIndexes(db, tName, table); err != nil {
+				errChan <- fmt.Errorf("error extracting indexes for %s: %w", tName, err)
+				return
+			}
+
+			if err := p.extractCheckConstraints(db, tName, table); err != nil {
+				errChan <- fmt.Errorf("error extracting check constraints for %s: %w", tName, err)
+				return
+			}
+
+			// Safely add to schema
+			mu.Lock()
+			schema.Tables[tName] = table
+			mu.Unlock()
+		}(tableName)
+	}
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+	close(errChan)
+
+	// Check for errors
+	if len(errChan) > 0 {
+		return nil, <-errChan
 	}
 
 	return schema, nil
@@ -516,6 +642,91 @@ func (m *MySQLDialect) ExtractSchema(db *sql.DB) (*Schema, error) {
 	return schema, nil
 }
 
+func (m *MySQLDialect) ExtractSchemaParallel(db *sql.DB) (*Schema, error) {
+	schema := &Schema{Tables: make(map[string]*Table)}
+
+	// Get database name
+	var dbName string
+	if err := db.QueryRow("SELECT DATABASE()").Scan(&dbName); err != nil {
+		return nil, err
+	}
+
+	// Get all tables
+	tables, err := m.getTables(db, dbName)
+	if err != nil {
+		return nil, err
+	}
+
+	// Use a wait group and mutex for parallel extraction
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	errChan := make(chan error, len(tables))
+
+	for _, tableName := range tables {
+		wg.Add(1)
+		go func(tName string) {
+			defer wg.Done()
+
+			table := &Table{
+				Name:              tName,
+				Columns:           make(map[string]*Column),
+				ForeignKeys:       make(map[string]*ForeignKey),
+				UniqueConstraints: make(map[string]*Unique),
+				Indexes:           make(map[string]*Index),
+				CheckConstraints:  make(map[string]*CheckConstr),
+			}
+
+			// Extract all metadata for this table
+			if err := m.extractColumns(db, dbName, tName, table); err != nil {
+				errChan <- fmt.Errorf("error extracting columns for %s: %w", tName, err)
+				return
+			}
+
+			if err := m.extractPrimaryKey(db, dbName, tName, table); err != nil {
+				errChan <- fmt.Errorf("error extracting primary key for %s: %w", tName, err)
+				return
+			}
+
+			if err := m.extractForeignKeys(db, dbName, tName, table); err != nil {
+				errChan <- fmt.Errorf("error extracting foreign keys for %s: %w", tName, err)
+				return
+			}
+
+			if err := m.extractUniqueConstraints(db, dbName, tName, table); err != nil {
+				errChan <- fmt.Errorf("error extracting unique constraints for %s: %w", tName, err)
+				return
+			}
+
+			if err := m.extractIndexes(db, dbName, tName, table); err != nil {
+				errChan <- fmt.Errorf("error extracting indexes for %s: %w", tName, err)
+				return
+			}
+
+			// Extract check constraints (MySQL 8.0.16+)
+			if err := m.extractCheckConstraints(db, dbName, tName, table); err != nil {
+				// Ignore errors for older MySQL versions
+				_ = err
+			}
+
+			// Safely add to schema
+			mu.Lock()
+			schema.Tables[tName] = table
+			mu.Unlock()
+		}(tableName)
+	}
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+	close(errChan)
+
+	// Check for errors
+	if len(errChan) > 0 {
+		return nil, <-errChan
+	}
+
+	return schema, nil
+}
+
 func (m *MySQLDialect) getTables(db *sql.DB, dbName string) ([]string, error) {
 	query := `
 		SELECT table_name
@@ -772,7 +983,7 @@ func (m *MySQLDialect) extractCheckConstraints(db *sql.DB, dbName, tableName str
 // DIFF ENGINE
 // ============================================================================
 
-func ComputeDiff(source, target *Schema) *SchemaDiff {
+func ComputeDiff(source, target *Schema, filter *FilterConfig) *SchemaDiff {
 	diff := &SchemaDiff{}
 
 	// Find tables only in source or target
@@ -783,21 +994,21 @@ func ComputeDiff(source, target *Schema) *SchemaDiff {
 	targetSet := makeSet(targetTableNames)
 
 	for _, name := range sourceTableNames {
-		if !targetSet[name] {
+		if !targetSet[name] && !filter.ShouldIgnoreTable(name) {
 			diff.TablesOnlyInSource = append(diff.TablesOnlyInSource, name)
 		}
 	}
 
 	for _, name := range targetTableNames {
-		if !sourceSet[name] {
+		if !sourceSet[name] && !filter.ShouldIgnoreTable(name) {
 			diff.TablesOnlyInTarget = append(diff.TablesOnlyInTarget, name)
 		}
 	}
 
 	// Compare common tables
 	for _, tableName := range sourceTableNames {
-		if targetSet[tableName] {
-			tableDiff := compareTable(source.Tables[tableName], target.Tables[tableName])
+		if targetSet[tableName] && !filter.ShouldIgnoreTable(tableName) {
+			tableDiff := compareTable(source.Tables[tableName], target.Tables[tableName], filter)
 			if !isTableDiffEmpty(tableDiff) {
 				diff.TableDiffs = append(diff.TableDiffs, tableDiff)
 			}
@@ -807,7 +1018,7 @@ func ComputeDiff(source, target *Schema) *SchemaDiff {
 	return diff
 }
 
-func compareTable(source, target *Table) *TableDiff {
+func compareTable(source, target *Table, filter *FilterConfig) *TableDiff {
 	diff := &TableDiff{TableName: source.Name}
 
 	// Compare columns
@@ -818,19 +1029,19 @@ func compareTable(source, target *Table) *TableDiff {
 	targetColSet := makeSet(targetColNames)
 
 	for _, name := range sourceColNames {
-		if !targetColSet[name] {
+		if !targetColSet[name] && !filter.ShouldIgnoreColumn(source.Name, name) {
 			diff.ColumnsOnlyInSource = append(diff.ColumnsOnlyInSource, name)
 		}
 	}
 
 	for _, name := range targetColNames {
-		if !sourceColSet[name] {
+		if !sourceColSet[name] && !filter.ShouldIgnoreColumn(target.Name, name) {
 			diff.ColumnsOnlyInTarget = append(diff.ColumnsOnlyInTarget, name)
 		}
 	}
 
 	for _, colName := range sourceColNames {
-		if targetColSet[colName] {
+		if targetColSet[colName] && !filter.ShouldIgnoreColumn(source.Name, colName) {
 			colDiff := compareColumn(source.Columns[colName], target.Columns[colName])
 			if colDiff != "" {
 				diff.ColumnDiffs = append(diff.ColumnDiffs, &ColumnDiff{
@@ -848,12 +1059,14 @@ func compareTable(source, target *Table) *TableDiff {
 	}
 
 	// Compare foreign keys
-	compareMaps(
-		source.ForeignKeys, target.ForeignKeys,
-		&diff.ForeignKeysOnlyInSource, &diff.ForeignKeysOnlyInTarget,
-		func(s, t *ForeignKey) string { return compareForeignKey(s, t) },
-		&diff.ForeignKeyDiffs,
-	)
+	if !filter.IgnoreForeignKeys {
+		compareMaps(
+			source.ForeignKeys, target.ForeignKeys,
+			&diff.ForeignKeysOnlyInSource, &diff.ForeignKeysOnlyInTarget,
+			func(s, t *ForeignKey) string { return compareForeignKey(s, t) },
+			&diff.ForeignKeyDiffs,
+		)
+	}
 
 	// Compare unique constraints
 	compareMaps(
@@ -864,20 +1077,24 @@ func compareTable(source, target *Table) *TableDiff {
 	)
 
 	// Compare indexes
-	compareMaps(
-		source.Indexes, target.Indexes,
-		&diff.IndexesOnlyInSource, &diff.IndexesOnlyInTarget,
-		func(s, t *Index) string { return compareIndex(s, t) },
-		&diff.IndexDiffs,
-	)
+	if !filter.IgnoreIndexes {
+		compareMaps(
+			source.Indexes, target.Indexes,
+			&diff.IndexesOnlyInSource, &diff.IndexesOnlyInTarget,
+			func(s, t *Index) string { return compareIndex(s, t) },
+			&diff.IndexDiffs,
+		)
+	}
 
 	// Compare check constraints
-	compareMaps(
-		source.CheckConstraints, target.CheckConstraints,
-		&diff.ChecksOnlyInSource, &diff.ChecksOnlyInTarget,
-		func(s, t *CheckConstr) string { return compareCheck(s, t) },
-		&diff.CheckDiffs,
-	)
+	if !filter.IgnoreChecks {
+		compareMaps(
+			source.CheckConstraints, target.CheckConstraints,
+			&diff.ChecksOnlyInSource, &diff.ChecksOnlyInTarget,
+			func(s, t *CheckConstr) string { return compareCheck(s, t) },
+			&diff.CheckDiffs,
+		)
+	}
 
 	return diff
 }
@@ -1022,6 +1239,126 @@ func compareMaps[T any, D any](
 			}
 		}
 	}
+}
+
+// ============================================================================
+// MIGRATION GENERATION
+// ============================================================================
+
+func GenerateMigrationSQL(diff *SchemaDiff, driver string) string {
+	var migrations []string
+
+	// Generate CREATE TABLE statements for tables only in target
+	for _, tableName := range diff.TablesOnlyInTarget {
+		migrations = append(migrations, fmt.Sprintf("-- Table '%s' exists in target but not in source", tableName))
+		migrations = append(migrations, fmt.Sprintf("-- Manual review required for table: %s\n", tableName))
+	}
+
+	// Generate DROP TABLE statements for tables only in source
+	for _, tableName := range diff.TablesOnlyInSource {
+		migrations = append(migrations, fmt.Sprintf("-- DROP TABLE %s;  -- Table exists in source but not in target\n", tableName))
+	}
+
+	// Generate ALTER TABLE statements for table differences
+	for _, tableDiff := range diff.TableDiffs {
+		tableMigrations := generateTableMigrations(tableDiff, driver)
+		if len(tableMigrations) > 0 {
+			migrations = append(migrations, fmt.Sprintf("-- Migrations for table: %s", tableDiff.TableName))
+			migrations = append(migrations, tableMigrations...)
+			migrations = append(migrations, "")
+		}
+	}
+
+	if len(migrations) == 0 {
+		return "-- No migrations needed\n"
+	}
+
+	header := fmt.Sprintf("-- Migration SQL generated for %s\n", driver)
+	header += "-- Review and test these statements before applying to production!\n"
+	header += "-- Some statements may need manual adjustment.\n\n"
+
+	return header + strings.Join(migrations, "\n")
+}
+
+func generateTableMigrations(diff *TableDiff, driver string) []string {
+	var migrations []string
+
+	// Add columns
+	for _, colName := range diff.ColumnsOnlyInTarget {
+		migrations = append(migrations, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s;  -- Column exists in target", diff.TableName, colName))
+	}
+
+	// Drop columns
+	for _, colName := range diff.ColumnsOnlyInSource {
+		migrations = append(migrations, fmt.Sprintf("-- ALTER TABLE %s DROP COLUMN %s;  -- Column exists in source but not in target", diff.TableName, colName))
+	}
+
+	// Modify columns
+	for _, colDiff := range diff.ColumnDiffs {
+		if driver == "postgres" {
+			migrations = append(migrations, fmt.Sprintf("-- ALTER TABLE %s ALTER COLUMN %s ...;  -- %s", diff.TableName, colDiff.ColumnName, colDiff.Diff))
+		} else {
+			migrations = append(migrations, fmt.Sprintf("-- ALTER TABLE %s MODIFY COLUMN %s ...;  -- %s", diff.TableName, colDiff.ColumnName, colDiff.Diff))
+		}
+	}
+
+	// Add indexes
+	for _, idxName := range diff.IndexesOnlyInTarget {
+		migrations = append(migrations, fmt.Sprintf("-- CREATE INDEX %s ON %s (...);  -- Index exists in target", idxName, diff.TableName))
+	}
+
+	// Drop indexes
+	for _, idxName := range diff.IndexesOnlyInSource {
+		if driver == "postgres" {
+			migrations = append(migrations, fmt.Sprintf("-- DROP INDEX %s;  -- Index exists in source but not in target", idxName))
+		} else {
+			migrations = append(migrations, fmt.Sprintf("-- DROP INDEX %s ON %s;  -- Index exists in source but not in target", idxName, diff.TableName))
+		}
+	}
+
+	// Add foreign keys
+	for _, fkName := range diff.ForeignKeysOnlyInTarget {
+		migrations = append(migrations, fmt.Sprintf("-- ALTER TABLE %s ADD CONSTRAINT %s FOREIGN KEY (...) REFERENCES ...;  -- FK exists in target", diff.TableName, fkName))
+	}
+
+	// Drop foreign keys
+	for _, fkName := range diff.ForeignKeysOnlyInSource {
+		if driver == "postgres" {
+			migrations = append(migrations, fmt.Sprintf("-- ALTER TABLE %s DROP CONSTRAINT %s;  -- FK exists in source but not in target", diff.TableName, fkName))
+		} else {
+			migrations = append(migrations, fmt.Sprintf("-- ALTER TABLE %s DROP FOREIGN KEY %s;  -- FK exists in source but not in target", diff.TableName, fkName))
+		}
+	}
+
+	// Add unique constraints
+	for _, uqName := range diff.UniquesOnlyInTarget {
+		migrations = append(migrations, fmt.Sprintf("-- ALTER TABLE %s ADD CONSTRAINT %s UNIQUE (...);  -- Unique constraint exists in target", diff.TableName, uqName))
+	}
+
+	// Drop unique constraints
+	for _, uqName := range diff.UniquesOnlyInSource {
+		if driver == "postgres" {
+			migrations = append(migrations, fmt.Sprintf("-- ALTER TABLE %s DROP CONSTRAINT %s;  -- Unique constraint exists in source but not in target", diff.TableName, uqName))
+		} else {
+			migrations = append(migrations, fmt.Sprintf("-- ALTER TABLE %s DROP INDEX %s;  -- Unique constraint exists in source but not in target", diff.TableName, uqName))
+		}
+	}
+
+	// Add check constraints
+	for _, chkName := range diff.ChecksOnlyInTarget {
+		migrations = append(migrations, fmt.Sprintf("-- ALTER TABLE %s ADD CONSTRAINT %s CHECK (...);  -- Check constraint exists in target", diff.TableName, chkName))
+	}
+
+	// Drop check constraints
+	for _, chkName := range diff.ChecksOnlyInSource {
+		if driver == "postgres" {
+			migrations = append(migrations, fmt.Sprintf("-- ALTER TABLE %s DROP CONSTRAINT %s;  -- Check constraint exists in source but not in target", diff.TableName, chkName))
+		} else {
+			migrations = append(migrations, fmt.Sprintf("-- ALTER TABLE %s DROP CHECK %s;  -- Check constraint exists in source but not in target", diff.TableName, chkName))
+		}
+	}
+
+	return migrations
 }
 
 // ============================================================================
@@ -1224,27 +1561,81 @@ func (d *CheckDiff) GetDiff() string  { return d.Diff }
 // ============================================================================
 
 func main() {
+	// Connection flags
 	sourceConn := flag.String("source", "", "Source database connection string")
 	sourceDriver := flag.String("source-driver", "", "Source database driver (postgres or mysql)")
 	targetConn := flag.String("target", "", "Target database connection string")
 	targetDriver := flag.String("target-driver", "", "Target database driver (postgres or mysql)")
+
+	// Output flags
 	asJSON := flag.Bool("json", false, "Output as JSON")
+	generateMigration := flag.Bool("migration", false, "Generate SQL migration script")
+
+	// Performance flags
+	parallel := flag.Bool("parallel", false, "Use parallel schema extraction (faster for large databases)")
+
+	// Filter flags
+	ignoreTables := flag.String("ignore-tables", "", "Comma-separated list of table names to ignore")
+	ignoreTablePattern := flag.String("ignore-table-pattern", "", "Regex pattern for table names to ignore")
+	ignoreIndexes := flag.Bool("ignore-indexes", false, "Ignore all index differences")
+	ignoreForeignKeys := flag.Bool("ignore-foreign-keys", false, "Ignore all foreign key differences")
+	ignoreChecks := flag.Bool("ignore-checks", false, "Ignore all check constraint differences")
 
 	flag.Parse()
 
 	// Validate flags
 	if *sourceConn == "" || *sourceDriver == "" || *targetConn == "" || *targetDriver == "" {
-		fmt.Fprintln(os.Stderr, "Usage: dbdiff --source <conn> --source-driver <driver> --target <conn> --target-driver <driver> [--json]")
-		fmt.Fprintln(os.Stderr, "\nDrivers: postgres, mysql")
+		fmt.Fprintln(os.Stderr, "Usage: dbdiff --source <conn> --source-driver <driver> --target <conn> --target-driver <driver> [options]")
+		fmt.Fprintln(os.Stderr, "\nRequired flags:")
+		fmt.Fprintln(os.Stderr, "  --source <conn>          Source database connection string")
+		fmt.Fprintln(os.Stderr, "  --source-driver <driver> Source database driver (postgres or mysql)")
+		fmt.Fprintln(os.Stderr, "  --target <conn>          Target database connection string")
+		fmt.Fprintln(os.Stderr, "  --target-driver <driver> Target database driver (postgres or mysql)")
+		fmt.Fprintln(os.Stderr, "\nOutput options:")
+		fmt.Fprintln(os.Stderr, "  --json                   Output as JSON")
+		fmt.Fprintln(os.Stderr, "  --migration              Generate SQL migration script")
+		fmt.Fprintln(os.Stderr, "\nPerformance options:")
+		fmt.Fprintln(os.Stderr, "  --parallel               Use parallel schema extraction (faster for large databases)")
+		fmt.Fprintln(os.Stderr, "\nFilter options:")
+		fmt.Fprintln(os.Stderr, "  --ignore-tables <list>   Comma-separated list of table names to ignore")
+		fmt.Fprintln(os.Stderr, "  --ignore-table-pattern <regex>  Regex pattern for table names to ignore")
+		fmt.Fprintln(os.Stderr, "  --ignore-indexes         Ignore all index differences")
+		fmt.Fprintln(os.Stderr, "  --ignore-foreign-keys    Ignore all foreign key differences")
+		fmt.Fprintln(os.Stderr, "  --ignore-checks          Ignore all check constraint differences")
 		fmt.Fprintln(os.Stderr, "\nExamples:")
-		fmt.Fprintln(os.Stderr, "  Postgres:")
+		fmt.Fprintln(os.Stderr, "  Basic comparison:")
 		fmt.Fprintln(os.Stderr, `    dbdiff --source "postgres://user:pass@localhost:5432/db1?sslmode=disable" --source-driver postgres \`)
 		fmt.Fprintln(os.Stderr, `           --target "postgres://user:pass@localhost:5432/db2?sslmode=disable" --target-driver postgres`)
-		fmt.Fprintln(os.Stderr, "\n  MySQL:")
-		fmt.Fprintln(os.Stderr, `    dbdiff --source "user:pass@tcp(localhost:3306)/db1?parseTime=true" --source-driver mysql \`)
-		fmt.Fprintln(os.Stderr, `           --target "user:pass@tcp(localhost:3306)/db2?parseTime=true" --target-driver mysql`)
+		fmt.Fprintln(os.Stderr, "\n  With filtering:")
+		fmt.Fprintln(os.Stderr, `    dbdiff --source "..." --source-driver postgres --target "..." --target-driver postgres \`)
+		fmt.Fprintln(os.Stderr, `           --ignore-tables "temp_table,old_table" --ignore-indexes`)
+		fmt.Fprintln(os.Stderr, "\n  Generate migration:")
+		fmt.Fprintln(os.Stderr, `    dbdiff --source "..." --source-driver postgres --target "..." --target-driver postgres --migration`)
+		fmt.Fprintln(os.Stderr, "\n  Parallel extraction:")
+		fmt.Fprintln(os.Stderr, `    dbdiff --source "..." --source-driver postgres --target "..." --target-driver postgres --parallel`)
 		os.Exit(1)
 	}
+
+	// Build filter config
+	filter := NewFilterConfig()
+	if *ignoreTables != "" {
+		filter.IgnoreTables = strings.Split(*ignoreTables, ",")
+		// Trim whitespace
+		for i := range filter.IgnoreTables {
+			filter.IgnoreTables[i] = strings.TrimSpace(filter.IgnoreTables[i])
+		}
+	}
+	if *ignoreTablePattern != "" {
+		pattern, err := regexp.Compile(*ignoreTablePattern)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid table pattern regex: %v\n", err)
+			os.Exit(1)
+		}
+		filter.IgnoreTablePattern = pattern
+	}
+	filter.IgnoreIndexes = *ignoreIndexes
+	filter.IgnoreForeignKeys = *ignoreForeignKeys
+	filter.IgnoreChecks = *ignoreChecks
 
 	// Connect to source database
 	sourceDB, err := sql.Open(*sourceDriver, *sourceConn)
@@ -1286,24 +1677,47 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Extract schemas
-	sourceSchema, err := sourceDialect.ExtractSchema(sourceDB)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error extracting source schema: %v\n", err)
-		os.Exit(1)
+	// Extract schemas (with optional parallel extraction)
+	var sourceSchema, targetSchema *Schema
+
+	if *parallel {
+		sourceSchema, err = sourceDialect.ExtractSchemaParallel(sourceDB)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error extracting source schema: %v\n", err)
+			os.Exit(1)
+		}
+
+		targetSchema, err = targetDialect.ExtractSchemaParallel(targetDB)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error extracting target schema: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		sourceSchema, err = sourceDialect.ExtractSchema(sourceDB)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error extracting source schema: %v\n", err)
+			os.Exit(1)
+		}
+
+		targetSchema, err = targetDialect.ExtractSchema(targetDB)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error extracting target schema: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
-	targetSchema, err := targetDialect.ExtractSchema(targetDB)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error extracting target schema: %v\n", err)
-		os.Exit(1)
+	// Compute diff with filter
+	diff := ComputeDiff(sourceSchema, targetSchema, filter)
+
+	// Output based on flags
+	if *generateMigration {
+		// Generate and print migration SQL
+		migrationSQL := GenerateMigrationSQL(diff, *sourceDriver)
+		fmt.Print(migrationSQL)
+	} else {
+		// Print diff output
+		PrintDiff(diff, *asJSON)
 	}
-
-	// Compute diff
-	diff := ComputeDiff(sourceSchema, targetSchema)
-
-	// Print output
-	PrintDiff(diff, *asJSON)
 
 	// Exit with appropriate code
 	if isDiffEmpty(diff) {

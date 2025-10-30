@@ -4,6 +4,8 @@ A fast, clean CLI tool written in Go that compares two databases (PostgreSQL/MyS
 
 ## Features
 
+### Schema Comparison
+
 Compares the following schema elements:
 
 - **Tables** - presence/absence
@@ -13,6 +15,15 @@ Compares the following schema elements:
 - **Unique Constraints** - columns
 - **Indexes** - name, columns, uniqueness
 - **Check Constraints** - expressions (where supported)
+
+### v2 Features ✨
+
+- **🔧 Migration Generation** - Automatically generate SQL migration scripts from detected differences
+- **🎯 Filtering Options** - Ignore specific tables, columns, or schema objects
+  - Ignore tables by name (comma-separated list)
+  - Ignore tables by regex pattern
+  - Ignore all indexes, foreign keys, or check constraints
+- **⚡ Parallel Extraction** - Concurrent schema extraction for faster performance on large databases
 
 ## Supported Databases
 
@@ -95,10 +106,34 @@ dbdiff \
   --source-driver <postgres|mysql> \
   --target <target-connection-string> \
   --target-driver <postgres|mysql> \
-  [--json]
+  [options]
 ```
 
-### PostgreSQL Example
+### Command-Line Options
+
+**Required Flags:**
+- `--source <conn>` - Source database connection string
+- `--source-driver <driver>` - Source database driver (postgres or mysql)
+- `--target <conn>` - Target database connection string
+- `--target-driver <driver>` - Target database driver (postgres or mysql)
+
+**Output Options:**
+- `--json` - Output as JSON (for automation/CI/CD)
+- `--migration` - Generate SQL migration script
+
+**Performance Options:**
+- `--parallel` - Use parallel schema extraction (faster for large databases)
+
+**Filter Options:**
+- `--ignore-tables <list>` - Comma-separated list of table names to ignore
+- `--ignore-table-pattern <regex>` - Regex pattern for table names to ignore
+- `--ignore-indexes` - Ignore all index differences
+- `--ignore-foreign-keys` - Ignore all foreign key differences
+- `--ignore-checks` - Ignore all check constraint differences
+
+### Examples
+
+#### Basic Comparison (PostgreSQL)
 
 ```bash
 dbdiff \
@@ -108,7 +143,7 @@ dbdiff \
   --target-driver postgres
 ```
 
-### MySQL Example
+#### MySQL Comparison
 
 ```bash
 dbdiff \
@@ -118,7 +153,7 @@ dbdiff \
   --target-driver mysql
 ```
 
-### Cross-Database Comparison
+#### Cross-Database Comparison
 
 You can compare schemas across different database types:
 
@@ -130,9 +165,64 @@ dbdiff \
   --target-driver mysql
 ```
 
-### JSON Output
+#### Generate Migration SQL
 
-For machine-readable output, use the `--json` flag:
+```bash
+dbdiff \
+  --source "postgres://user:pass@localhost:5432/db1?sslmode=disable" \
+  --source-driver postgres \
+  --target "postgres://user:pass@localhost:5432/db2?sslmode=disable" \
+  --target-driver postgres \
+  --migration > migration.sql
+```
+
+#### Ignore Specific Tables
+
+```bash
+dbdiff \
+  --source "..." \
+  --source-driver postgres \
+  --target "..." \
+  --target-driver postgres \
+  --ignore-tables "temp_logs,old_data,cache_table"
+```
+
+#### Ignore Tables by Pattern
+
+```bash
+# Ignore all tables starting with "temp_" or "old_"
+dbdiff \
+  --source "..." \
+  --source-driver postgres \
+  --target "..." \
+  --target-driver postgres \
+  --ignore-table-pattern "^(temp_|old_)"
+```
+
+#### Ignore Indexes and Foreign Keys
+
+```bash
+dbdiff \
+  --source "..." \
+  --source-driver postgres \
+  --target "..." \
+  --target-driver postgres \
+  --ignore-indexes \
+  --ignore-foreign-keys
+```
+
+#### Parallel Extraction for Large Databases
+
+```bash
+dbdiff \
+  --source "..." \
+  --source-driver postgres \
+  --target "..." \
+  --target-driver postgres \
+  --parallel
+```
+
+#### JSON Output for CI/CD
 
 ```bash
 dbdiff \
